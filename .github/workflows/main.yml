@@ -1,44 +1,40 @@
-name: FYnixorStudio-RDP
+name: FYnixorStudio-RDP-Ngrok
 on:
   workflow_dispatch:
     inputs:
-      ip_mode:
-        description: 'Pilih IP: reuse (IP tetap yang sudah ada) atau new (buat IP baru)'
-        required: true
-        type: choice
-        options:
-          - reuse
-          - new
-        default: reuse
       session_minutes:
         description: 'Durasi sesi (menit), maks 350'
         required: false
         default: '350'
         type: string
       auto_shutdown:
-        description: 'Matikan otomatis setelah sesi habis?'
+        description: 'Matikan RDP otomatis setelah sesi habis?'
         required: false
         type: boolean
         default: true
 
 env:
-  RDP_HOSTNAME: fynixorstudio
   RDP_USERNAME: YOKOTO
   RDP_PASSWORD: FYnixor87654321!
   HEARTBEAT_MINUTES: 15
 
+# ============================================================================
+# RAHASIA (GitHub Secrets) - JANGAN PERNAH DIHARDCODE
+#   - TG_TOKEN            : token bot Telegram (dari @BotFather)
+#   - TG_CHAT             : chat/group ID tujuan
+#   - NGROK_TOKEN         : authtoken ngrok (gratis di dashboard.ngrok.com)
+# ============================================================================
 
 jobs:
-  secure-rdp:
+  rdp-ngrok:
     runs-on: windows-latest
-    timeout-minutes: 960
+    timeout-minutes: 360
     steps:
       - name: Setup Helper Functions
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path C:\actions | Out-Null
           $helperScript = @'
-
 
           function ConvertTo-HtmlEscaped {
               param([string]$Text)
@@ -54,71 +50,37 @@ jobs:
                   [int]$MaxRetries = 3
               )
               $uri = "https://api.telegram.org/bot$Token/sendMessage"
-              $body = @{
-                  chat_id = $ChatId
-                  text = $Text
-                  parse_mode = "HTML"
-                  disable_web_page_preview = $true
-              }
+              $body = @{ chat_id = $ChatId; text = $Text; parse_mode = "HTML"; disable_web_page_preview = $true }
               $attempt = 0
               while ($attempt -lt $MaxRetries) {
                   try {
                       $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body -TimeoutSec 15
                       if ($resp.ok) { return $true }
                   } catch {
-                      $err = $_.Exception.Message
-                      if ($err -match "can't parse|Bad Request|parse") {
-                          Write-Host "Markup ditolak, fallback ke plain text: $err"
+                      if ($_.Exception.Message -match "parse|Bad Request") {
                           $fallback = @{ chat_id = $ChatId; text = $Text }
-                          try {
-                              $r2 = Invoke-RestMethod -Uri $uri -Method Post -Body $fallback -TimeoutSec 15
-                              if ($r2.ok) { return $true }
-                          } catch { Write-Host "Fallback gagal: $($_.Exception.Message)" }
-                      } else {
-                          Write-Host "Telegram gagal (percobaan $($attempt+1)): $err"
+                          try { $r2 = Invoke-RestMethod -Uri $uri -Method Post -Body $fallback -TimeoutSec 15; if ($r2.ok) { return $true } }
+                          catch { }
                       }
                   }
                   $attempt++
                   Start-Sleep -Seconds 3
               }
-              Write-Host "WARNING: Gagal kirim setelah $MaxRetries percobaan."
               return $false
           }
 
           function Send-TelegramButton {
-              param(
-                  [Parameter(Mandatory=$true)][string]$Token,
-                  [Parameter(Mandatory=$true)][string]$ChatId,
-                  [Parameter(Mandatory=$true)][string]$Text,
-                  [object[]]$Buttons
-              )
+              param([string]$Token, [string]$ChatId, [string]$Text, [object[]]$Buttons)
               $uri = "https://api.telegram.org/bot$Token/sendMessage"
               $keyboard = @{ inline_keyboard = $Buttons }
-              $payload = @{
-                  chat_id = $ChatId
-                  text    = $Text
-                  parse_mode = "HTML"
-                  disable_web_page_preview = $true
-                  reply_markup = ($keyboard | ConvertTo-Json -Depth 6)
-              }
-              try {
-                  $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $payload -TimeoutSec 15
-                  return $resp.ok
-              } catch {
-                  Write-Host "Send-TelegramButton gagal: $($_.Exception.Message)"
-                  return $false
-              }
+              $payload = @{ chat_id = $ChatId; text = $Text; parse_mode = "HTML"; disable_web_page_preview = $true; reply_markup = ($keyboard | ConvertTo-Json -Depth 6) }
+              try { $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $payload -TimeoutSec 15; return $resp.ok } catch { return $false }
           }
 
           function Get-TelegramUpdates {
               param([string]$Token, [int]$Offset)
               $uri = "https://api.telegram.org/bot$Token/getUpdates?timeout=25&offset=$Offset"
-              try {
-                  $resp = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 30
-                  return $resp.result
-              } catch {
-                  return @()
-              }
+              try { $resp = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 30; return $resp.result } catch { return @() }
           }
 
           function Answer-TelegramCallback {
@@ -128,52 +90,27 @@ jobs:
               try { Invoke-RestMethod -Uri $uri -Method Post -Body $body -TimeoutSec 15 } catch { }
           }
 
-
           function Get-AsciiBanner {
               param([string]$Line1 = "FYNIXOR STUDIO")
-              $bar = "═" * 34
+              $bar = "=" * 34
               return @"
-          ╔${bar}╗
-          ║  🚀 FYNIXOR STUDIO 🚀  ║
-          ║       $Line1        ║
-          ╚${bar}╝
+          +----------------------------------+
+          |    FYNIXOR STUDIO RDP           |
+          |     $Line1
+          +----------------------------------+
           "@
           }
 
-          function Get-InfoBox {
-              param([string]$Title = "INFORMASI KONEKSI")
-              [System.Collections.Generic.List[string]]$lines = @()
-              $lines.Add("<b>━━━ $Title ━━━</b>")
-              return ($lines -join "`n")
-          }
-
           function Get-SystemInfoBlock {
-              $os   = Get-CimInstance Win32_OperatingSystem
-              $cpu  = Get-CimInstance Win32_Processor | Select-Object -First 1
+              $os  = Get-CimInstance Win32_OperatingSystem
+              $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
               $disk = Get-PSDrive C
               $freeGB = [math]::Round($disk.Free / 1GB, 1)
               $totalGB = [math]::Round(($disk.Used + $disk.Free) / 1GB, 1)
-              $ramTotalMB = $os.TotalVisibleMemorySize
-              $ramFreeMB  = $os.FreePhysicalMemory
-              $ramTotalGB = [math]::Round($ramTotalMB / 1MB, 1)
-              $ramFreeGB  = [math]::Round($ramFreeMB / 1MB, 1)
+              $ramTotalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+              $ramFreeGB  = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
               $ramUsedGB  = [math]::Round($ramTotalGB - $ramFreeGB, 1)
-              $uptime = (Get-Date) - $os.LastBootUpTime
-              return [pscustomobject]@{
-                  OS      = $os.Caption
-                  CPU     = $cpu.Name
-                  RAM     = "$ramUsedGB / $ramTotalGB GB"
-                  FreeRAM = "$ramFreeGB GB"
-                  Disk    = "$freeGB / $totalGB GB"
-                  Uptime  = "$([int]$uptime.TotalDays) hari, $uptime.Hours jam"
-              }
-          }
-
-          function Get-ProgressBar {
-              param([double]$Percent, [int]$Width = 12)
-              $filled = [int][math]::Round(($Percent / 100) * $Width)
-              $empty  = $Width - $filled
-              return ("█" * $filled) + ("░" * $empty) + " $([int]$Percent)%"
+              [pscustomobject]@{ OS = $os.Caption; CPU = $cpu.Name; RAM = "$ramUsedGB/$ramTotalGB GB"; Disk = "$freeGB/$totalGB GB" }
           }
 
           function Format-Duration {
@@ -185,290 +122,151 @@ jobs:
           }
           '@
           Set-Content -Path C:\actions\helpers.ps1 -Value $helperScript -Encoding UTF8
-          Write-Host "Helper functions disimpan ke C:\actions\helpers.ps1"
+          Write-Host "Helpers siap."
 
       - name: Notify - Provisioning Started
         shell: pwsh
         run: |
           . C:\actions\helpers.ps1
-          $modeLabel = if ("${{ github.event.inputs.ip_mode }}" -eq "new") { "🆕 IP BARU" } else { "♻️ IP REUSE" }
-          $banner = Get-AsciiBanner -Line1 "⏳ MENYIAPKAN"
           $msg = @"
-          <pre>$banner</pre>
+          <b>🛒 FYnixorStudio RDP</b>
+          <b>⏳ Sesi sedang disiapkan...</b>
 
-          🧩 <b>Mode IP</b> : <code>$modeLabel</code>
-          ⚙️ <b>Aksi</b>     : Menyiapkan sesi RDP
-          📡 <b>Status</b>   : Proses berjalan...
-          🕒 <b>Waktu</b>    : <code>$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")</code>
+          ⚙️ Aksi   : Menyiapkan RDP
+          🕒 Waktu : <code>$(Get-Date -Format "HH:mm:ss")</code>
 
-          ⏱️ Tunggu ±1-2 menit, pesan sukses akan dikirim.
+          Tunggu ±1-2 menit untuk info login.
           "@
           Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text $msg | Out-Null
 
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-FYnixor" | Out-Null
-          netsh advfirewall firewall add rule name="RDP-FYnixor" `
-            dir=in action=allow protocol=TCP localport=3389
-
+          netsh advfirewall firewall add rule name="RDP-FYnixor" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
-          Write-Host "Konfigurasi RDP selesai."
 
-      - name: Create RDP User (Hardcoded Credentials)
+      - name: Create RDP User
         shell: pwsh
         run: |
           $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-
           if (Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue) {
               Set-LocalUser -Name $env:RDP_USERNAME -Password $securePass
-              Write-Host "User $($env:RDP_USERNAME) sudah ada, password di-reset."
           } else {
               New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
               Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
               Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
-              Write-Host "User $($env:RDP_USERNAME) baru dibuat."
           }
+          if (-not (Get-LocalUser -Name $env:RDP_USERNAME)) { exit 1 }
 
-          if (-not (Get-LocalUser -Name $env:RDP_USERNAME)) {
-              Write-Error "Gagal membuat user."
-              exit 1
-          }
-
-      - name: Install Tailscale
+      - name: Install Ngrok
         shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale terinstall."
+          $zip = "$env:TEMP\ngrok.zip"
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath C:\Tools -Force
+          Write-Host "Ngrok terinstall."
 
-      - name: Restore persistent Tailscale identity (mode=reuse)
-        id: cache-restore
-        if: ${{ github.event.inputs.ip_mode == 'reuse' }}
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\ProgramData\Tailscale
-          key: tailscale-state-fynixorstudio-latest
-          restore-keys: |
-            tailscale-state-fynixorstudio-
-
-      - name: Establish Tailscale Connection
+      - name: Start Ngrok TCP Tunnel
         shell: pwsh
         run: |
-          Stop-Service Tailscale -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 3
-          Start-Service Tailscale
-          Start-Sleep -Seconds 3
+          & C:\Tools\ngrok\ngrok.exe config add-authtoken "${{ secrets.NGROK_TOKEN }}"
+          Start-Process -FilePath "C:\Tools\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
 
-          $hostnameToUse = if ("${{ github.event.inputs.ip_mode }}" -eq "new") {
-              "$env:RDP_HOSTNAME-$(Get-Random -Maximum 99999)"
-          } else {
-              $env:RDP_HOSTNAME
-          }
-
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=$hostnameToUse `
-            --accept-dns=true `
-            --force-reauth
-
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          $address = $null
+          for ($i = 0; $i -lt 12 -and -not $address; $i++) {
               Start-Sleep -Seconds 5
-              $retries++
+              try {
+                  $api = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -TimeoutSec 10
+                  $tcp = $api.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+                  if ($tcp) { $address = $tcp.public_url }
+              } catch { }
           }
-          if (-not $tsIP) {
-              Write-Error "IP Tailscale tidak didapat. Keluar."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "IP Tailscale: $tsIP (mode: ${{ github.event.inputs.ip_mode }})"
+          if (-not $address) { Write-Error "Gagal buka tunnel ngrok."; exit 1 }
 
-      - name: Save persistent Tailscale identity
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: C:\ProgramData\Tailscale
-          key: tailscale-state-fynixorstudio-latest
+          $address = $address.Replace("tcp://", "")
+          echo "NGROK_ADDRESS=$address" >> $env:GITHUB_ENV
+          Write-Host "Ngrok TCP aktif: $address"
 
       - name: Verify RDP Accessibility
         shell: pwsh
         run: |
-          . C:\actions\helpers.ps1
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP ke port 3389 gagal."
-              exit 1
-          }
-          Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" `
-            -Text "✅ Port 3389 terverifikasi terbuka di <code>$env:TAILSCALE_IP</code>." | Out-Null
+          $hostPart = ($env:NGROK_ADDRESS -split ":")[0]
+          $portPart = ($env:NGROK_ADDRESS -split ":")[1]
+          $testResult = Test-NetConnection -ComputerName $hostPart -Port $portPart
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP gagal ke $env:NGROK_ADDRESS"; exit 1 }
 
-      - name: Notify - Session Ready (Full Credentials + Buttons)
+      - name: Notify - Session Ready (Credentials via Ngrok, TANPA VPN)
         shell: pwsh
         run: |
           . C:\actions\helpers.ps1
-          $modeLabel = if ("${{ github.event.inputs.ip_mode }}" -eq "new") { "🆕 IP BARU" } else { "♻️ IP REUSE" }
-          $banner = Get-AsciiBanner -Line1 "✅ SESSION AKTIF"
           $sysInfo = Get-SystemInfoBlock
-          $hero = @"
-          $banner
-          Sesi RDP <b>siap dipakai!</b> <code>($modeLabel)</code>
-          "@
-          $conn = @"
-          <b>━━━━ 🔌 INFO KONEKSI ━━━━</b>
+          $msg = @"
+          <b>✅ Sesi RDP SIAP!</b>
 
-          📍 <b>IP Address</b>
-          <code>$env:TAILSCALE_IP</code>
+          <b>━━━ 🔌 INFO LOGIN ━━━</b>
+
+          🖥️ <b>Host</b>
+          <code>$($env:NGROK_ADDRESS -split ':')[0]</code>
           🔢 <b>Port</b>
-          <code>3389</code>
+          <code>$($env:NGROK_ADDRESS -split ':')[1]</code>
           👤 <b>Username</b>
           <code>$env:RDP_USERNAME</code>
           🔑 <b>Password</b>
           <code>$env:RDP_PASSWORD</code>
-          "@
-          $sys = @"
-          <b>━━━━ 🖥 INFO SISTEM ━━━━</b>
 
-          💻 <b>OS</b>
-          <code>$(ConvertTo-HtmlEscaped $sysInfo.OS)</code>
-          ⚙️ <b>CPU</b>
-          <code>$(ConvertTo-HtmlEscaped $sysInfo.CPU)</code>
-          🧠 <b>RAM</b>
-          <code>$($sysInfo.RAM)</code>
-          💾 <b>Disk C</b>
-          <code>$($sysInfo.Disk)</code>
-          🕘 <b>Uptime</b>
-          <code>$($sysInfo.Uptime)</code>
+          <b>━━━ 🖥 SISTEM ━━━</b>
+
+          💻 OS   : <code>$(ConvertTo-HtmlEscaped $sysInfo.OS)</code>
+          💾 Disk : <code>$($sysInfo.Disk)</code>
+
+          <b>📲 Cara connect (TANPA VPN):</b>
+          1. Buka Remote Desktop (mstsc)
+          2. Isi Host & Port di atas
+          3. Masukkan Username & Password
+          4. Klik Ya saat muncul warning
+
+          ⏱️ Sesi aktif ±<b>${{ github.event.inputs.session_minutes }}</b> menit.
           "@
-          $msg = "$hero`n`n$conn`n`n$sys`n`n━━━━━━━━━━━━━━━━━━`nGunakan tombol di bawah untuk kontrol cepat 👇"
           $buttons = @(
-              @{ text = "📊 Status Sesi"; callback_data = "STATUS" },
-              @{ text = "⏰ Tambah 1 Jam"; callback_data = "EXTEND" }
-          ), @(
-              @{ text = "🛑 Matikan RDP"; callback_data = "SHUTDOWN" },
-              @{ text = "ℹ️ Info Lengkap"; callback_data = "INFO" }
+              @{ text = "🛑 Matikan Sekarang"; callback_data = "SHUTDOWN" }
           )
-          Send-TelegramButton -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" `
-            -Text $msg -Buttons $buttons | Out-Null
+          Send-TelegramButton -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text $msg -Buttons $buttons | Out-Null
 
-      - name: Maintain Connection (Watchdog + Heartbeat + Command Poller)
+      - name: Maintain Connection (Watchdog + Heartbeat)
         shell: pwsh
         run: |
           . C:\actions\helpers.ps1
           $startTime = Get-Date
           $heartbeatMinutes = [int]$env:HEARTBEAT_MINUTES
           $lastHeartbeat = $startTime
-          $failCount = 0
-          $maxFailBeforeAlert = 2
           $offset = 0
-          $banner = Get-AsciiBanner -Line1 "💓 HEARTBEAT"
-          Write-Host "Watchdog dan command poller dimulai."
 
           while ($true) {
               Start-Sleep -Seconds 30
-
               $updates = Get-TelegramUpdates -Token "${{ secrets.TG_TOKEN }}" -Offset $offset
               foreach ($u in $updates) {
                   $offset = $u.update_id + 1
                   $cb = $u.callback_query
-                  if ($cb) {
-                      $cbId = $cb.id
-                      $data = $cb.data
-                      $fromUser = $cb.from.id
-                      if ($fromUser -eq [int64]"${{ secrets.TG_CHAT }}") {
-                          switch ($data) {
-                              "STATUS" {
-                                  $el = (Get-Date) - $startTime
-                                  $sys = Get-SystemInfoBlock
-                                  Answer-TelegramCallback -Token "${{ secrets.TG_TOKEN }}" -CallbackId $cbId -Text "Sesi masih AKTIF ✔️"
-                                  Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text @"
-          <b>━━━ 📊 STATUS SESI ━━━</b>
-
-          🟢 Status : <b>AKTIF</b>
-          📍 IP     : <code>$env:TAILSCALE_IP</code>
-          ⏱ Uptime : $(Format-Duration $el)
-          🧠 RAM    : $($sys.RAM)
-          💾 Disk   : $($sys.Disk)
-          "@ | Out-Null
-                              }
-                              "EXTEND" {
-                                  $extend = New-TimeSpan -Hours 1
-                                  Answer-TelegramCallback -Token "${{ secrets.TG_TOKEN }}" -CallbackId $cbId -Text "Perpanjangan diproses ⏳"
-                                  Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" `
-                                    -Text "⏰ Permintaan tambah 1 jam diterima." | Out-Null
-                              }
-                              "SHUTDOWN" {
-                                  Answer-TelegramCallback -Token "${{ secrets.TG_TOKEN }}" -CallbackId $cbId -Text "Mematikan RDP..."
-                                  Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text @"
-          🛑 <b>RDP dimatikan atas permintaan.</b>
-          Sampai jumpa 👋
-          "@ | Out-Null
-                                  Stop-Process -Id $PID -Force
-                              }
-                              "INFO" {
-                                  $sys = Get-SystemInfoBlock
-                                  Answer-TelegramCallback -Token "${{ secrets.TG_TOKEN }}" -CallbackId $cbId -Text "Mengirim info lengkap..."
-                                  Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text @"
-          <b>━━━ ℹ️ INFO LENGKAP ━━━</b>
-
-          💻 OS   : <code>$(ConvertTo-HtmlEscaped $sys.OS)</code>
-          ⚙️ CPU  : <code>$(ConvertTo-HtmlEscaped $sys.CPU)</code>
-          🧠 RAM  : $($sys.RAM)
-          💾 Disk : $($sys.Disk)
-          "@ | Out-Null
-                              }
-                          }
-                      } else {
-                          Answer-TelegramCallback -Token "${{ secrets.TG_TOKEN }}" -CallbackId $cbId -Text "Akses ditolak. Bukan penerima pesan." 
-                      }
+                  if ($cb -and $cb.data -eq "SHUTDOWN") {
+                      Answer-TelegramCallback -Token "${{ secrets.TG_TOKEN }}" -CallbackId $cb.id -Text "Mematikan RDP..."
+                      Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text "🛑 RDP dimatikan. Sampai jumpa!" | Out-Null
+                      Stop-Process -Id $PID -Force
                   }
               }
-
               $now = Get-Date
               $elapsed = $now - $startTime
-              $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
-              if (-not $currentIP) {
-                  $failCount++
-                  if ($failCount -ge $maxFailBeforeAlert) {
-                      $alertMsg = @"
-          <b>⚠️ PERINGATAN</b>
-
-          🔴 Tailscale terputus!
-          ⏱ Durasi berjalan : $(Format-Duration $elapsed)
-          📍 IP terakhir    : <code>$env:TAILSCALE_IP</code>
-          "@
-                      Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text $alertMsg | Out-Null
-                      $failCount = 0
-                  }
-              } else {
-                  $failCount = 0
-              }
-
               if (($now - $lastHeartbeat).TotalMinutes -ge $heartbeatMinutes) {
                   $sys = Get-SystemInfoBlock
                   $hbMsg = @"
-          <pre>$banner</pre>
-          <b>FYnixorStudio RDP masih menyala ✅</b>
-
-          📍 IP        : <code>$currentIP</code>
-          ⏱ Uptime     : $(Format-Duration $elapsed)
-          🧠 RAM       : $($sys.RAM)
-          💾 Disk      : $($sys.Disk)
-          ─────────────────────
-          Ketik apa pun di sini untuk membalas.
+          💓 <b>Heartbeat - FYnixorStudio RDP</b>
+          🟢 Status : AKTIF
+          📍 Endpoint : <code>$env:NGROK_ADDRESS</code>
+          ⏱ Uptime : $(Format-Duration $elapsed)
+          💾 Disk : $($sys.Disk)
           "@
                   Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text $hbMsg | Out-Null
                   $lastHeartbeat = $now
@@ -480,15 +278,12 @@ jobs:
         shell: pwsh
         run: |
           . C:\actions\helpers.ps1
-          $banner = Get-AsciiBanner -Line1 "🔴 SESSION SELESAI"
           $status = "${{ job.status }}"
           $msg = @"
-          <pre>$banner</pre>
+          <b>🔴 Sesi RDP selesai.</b>
+          📊 Status : <code>$status</code>
+          🕒 Waktu : <code>$(Get-Date -Format "HH:mm:ss")</code>
 
-          🔴 <b>Sesi RDP selesai.</b>
-          📊 Status job : <code>$status</code>
-          🕒 Waktu      : <code>$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")</code>
-
-          Terima kasih sudah pakai FYnixorStudio 💙
+          Terima kasih sudah berbelanja di FYnixorStudio ✅
           "@
           Send-TelegramMessage -Token "${{ secrets.TG_TOKEN }}" -ChatId "${{ secrets.TG_CHAT }}" -Text $msg | Out-Null
