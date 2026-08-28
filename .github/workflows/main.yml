@@ -196,7 +196,7 @@ jobs:
           $msg = @"
           <pre>$banner</pre>
 
-          🧩 <b>Mode IP</b> : <code>$([ConvertTo-HtmlEscaped "$modeLabel"])</code>
+          🧩 <b>Mode IP</b> : <code>$modeLabel</code>
           ⚙️ <b>Aksi</b>     : Menyiapkan sesi RDP
           📡 <b>Status</b>   : Proses berjalan...
           🕒 <b>Waktu</b>    : <code>$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")</code>
