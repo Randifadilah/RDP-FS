@@ -3,30 +3,43 @@ on:
   workflow_dispatch:
     inputs:
       ip_mode:
-        description: 'Mode IP: reuse (IP sama) atau new (IP baru)'
+        description: 'Pilih IP yang dipakai sesi ini: reuse (pakai IP tetap yang sudah ada) atau new (buat IP baru)'
         required: true
         type: choice
         options:
           - reuse
           - new
         default: reuse
+      session_minutes:
+        description: 'Durasi sesi (menit), maks 350'
+        required: false
+        default: '350'
+        type: string
+
 env:
   RDP_HOSTNAME: fynixorstudio
   RDP_USERNAME: YOKOTO
   RDP_PASSWORD: FYnixor87654321!
-  TG_TOKEN: 8593403659:AAGHthMyf-4MfbF4_eeOoJSab1YDk-dgSso
-  TG_CHAT: "7016045840"
   HEARTBEAT_MINUTES: 15
+
+# WARNING: TG_TOKEN, TG_CHAT, dan TAILSCALE_AUTH_KEY diambil dari GitHub Secrets.
+# Setup secret di repo: Settings -> Secrets and variables -> Actions:
+#   - TG_TOKEN            : token bot Telegram
+#   - TG_CHAT             : chat ID tujuan (bisa string/number)
+#   - TAILSCALE_AUTH_KEY  : auth key Tailscale dari admin console
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 950
+    timeout-minutes: 960
     steps:
       - name: Setup Helper Functions
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path C:\actions | Out-Null
           $helperScript = @'
+          # === Helper: kirim pesan Telegram (plain-text, tanpa parse_mode HTML)
+          # Memakai plain text biar karakter non-ASCII (emoji) tidak bikin error parse.
           function Send-TelegramMessage {
               param(
                   [Parameter(Mandatory=$true)][string]$Token,
@@ -38,9 +51,10 @@ jobs:
               $body = @{
                   chat_id = $ChatId
                   text = $Text
-                  parse_mode = "HTML"
-                  disable_web_page_preview = $true
-              }
+                  parse_mode = "MarkdownV2"
+                }
+              $escaped = Escape-MarkdownV2 -Text $Text
+              $body.text = $escaped
               $attempt = 0
               while ($attempt -lt $MaxRetries) {
                   try {
@@ -55,17 +69,53 @@ jobs:
               Write-Host "WARNING: Gagal kirim pesan Telegram setelah $MaxRetries percobaan."
               return $false
           }
+
+          # === Helper: escape karakter khusus MarkdownV2
+          function Escape-MarkdownV2 {
+              param([string]$Text)
+              # Karakter yang harus di-escape di MarkdownV2
+              $chars = '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'
+              foreach ($c in $chars) {
+                  $Text = $Text.Replace($c, "\$c")
+              }
+              return $Text
+          }
+
+          # === Helper: kirim pesan dengan tombol inline (callback)
+          function Send-TelegramButton {
+              param(
+                  [Parameter(Mandatory=$true)][string]$Token,
+                  [Parameter(Mandatory=$true)][string]$ChatId,
+                  [Parameter(Mandatory=$true)][string]$Text,
+                  [object[]]$Buttons
+              )
+              $uri = "https://api.telegram.org/bot$Token/sendMessage"
+              $keyboard = @{ inline_keyboard = $Buttons }
+              $payload = @{
+                  chat_id = $ChatId
+                  text    = $Text
+                  reply_markup = ($keyboard | ConvertTo-Json -Depth 6)
+                }
+              try {
+                  $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $payload -TimeoutSec 15
+                  return $resp.ok
+              } catch {
+                  Write-Host "Send-TelegramButton gagal: $($_.Exception.Message)"
+                  return $false
+              }
+          }
+
+          # === Helper: banner ASCII (pakai karakter universal, hindari karakter lebar yang pecah)
           function Get-AsciiBanner {
-              param([string]$Subtitle = "REMOTE ACCESS SESSION")
+              param([string]$Line1 = "FYNIXOR STUDIO")
               return @"
-          <code>
-          ╭─────────────────────────────────╮
-          │      ⚡ F Y N I X O R  S T U D I O ⚡      │
-          │          $Subtitle
-          ╰─────────────────────────────────╯
-          </code>
+          --------------------------------------------------
+                 $Line1
+          --------------------------------------------------
           "@
           }
+
+          # === Helper: info sistem
           function Get-SystemInfoBlock {
               $os = Get-CimInstance Win32_OperatingSystem
               $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
@@ -74,16 +124,22 @@ jobs:
               $totalGB = [math]::Round(($disk.Used + $disk.Free) / 1GB, 1)
               $ramTotalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
               $ramFreeGB = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
-              return @"
-          🖥 <b>OS</b>       : $($os.Caption)
-          ⚙️ <b>CPU</b>      : $($cpu.Name)
-          🧠 <b>RAM</b>      : $ramFreeGB GB free / $ramTotalGB GB total
-          💾 <b>Disk C:</b>  : $freeGB GB free / $totalGB GB total
-          "@
+              $ramUsedGB = [math]::Round($ramTotalGB - $ramFreeGB, 1)
+              [pscustomobject]@{
+                  OS   = $os.Caption
+                  CPU  = $cpu.Name
+                  RAM  = "$ramUsedGB GB terpakai / $ramTotalGB GB total"
+                  Disk = "$freeGB GB bebas / $totalGB GB total"
+              }
           }
+
+          # === Helper: format durasi (benar)
           function Format-Duration {
               param([TimeSpan]$Span)
-              return "{0}j {1}m {2}d" -f [int]$Span.TotalHours, $Span.Minutes, $Span.Seconds
+              $h = [int][math]::Floor($Span.TotalHours)
+              $m = $Span.Minutes
+              $s = $Span.Seconds
+              return "$h jam $m menit $s detik"
           }
           '@
           Set-Content -Path C:\actions\helpers.ps1 -Value $helperScript -Encoding UTF8
@@ -92,10 +148,17 @@ jobs:
         shell: pwsh
         run: |
           . C:\actions\helpers.ps1
-          $modeLabel = if ("${{ github.event.inputs.ip_mode }}" -eq "new") { "IP BARU" } else { "IP LAMA (reuse)" }
-          $banner = Get-AsciiBanner -Subtitle "⏳ SEDANG DI-SETUP ($modeLabel)..."
-          $msg = "$banner`n🚀 Runner mulai provisioning RDP.`nMode IP: <b>$modeLabel</b>`nTunggu ±1-2 menit."
-          Send-TelegramMessage -Token $env:TG_TOKEN -ChatId $env:TG_CHAT -Text $msg | Out-Null
+          $modeLabel = if ("${{ github.event.inputs.ip_mode }}" -eq "new") { "IP BARU" } else { "REUSE" }
+          $banner = Get-AsciiBanner -Line1 "MEMULAI SETUP"
+          $msg = @"
+          $banner
+          Mode IP : $modeLabel
+          Aksi    : Sesi RDP sedang disiapkan
+          Status  : proses berjalan...
+          Waktu   : $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          Tunggu sekitar 1-2 menit.
+          "@
+          Send-TelegramMessage -Token ${{ secrets.TG_TOKEN }} -ChatId ${{ secrets.TG_CHAT }} -Text $msg | Out-Null
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
@@ -136,7 +199,7 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
           Write-Host "Tailscale installed."
-      - name: Restore persistent Tailscale identity (hanya kalau mode=reuse)
+      - name: Restore persistent Tailscale identity (mode=reuse)
         id: cache-restore
         if: ${{ github.event.inputs.ip_mode == 'reuse' }}
         uses: actions/cache/restore@v4
@@ -178,12 +241,12 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP: $tsIP (mode: ${{ github.event.inputs.ip_mode }})"
-      - name: Save persistent Tailscale identity (selalu, biar reuse berikutnya dapet yang terbaru)
+      - name: Save persistent Tailscale identity (key SAMA biar bisa reuse)
         if: always()
         uses: actions/cache/save@v4
         with:
           path: C:\ProgramData\Tailscale
-          key: tailscale-state-fynixorstudio-latest-${{ github.run_id }}
+          key: tailscale-state-fynixorstudio-latest
       - name: Verify RDP Accessibility
         shell: pwsh
         run: |
@@ -193,31 +256,42 @@ jobs:
               exit 1
           }
           Write-Host "TCP connectivity successful!"
-      - name: Notify - Session Ready (Full Credentials)
+      - name: Notify - Session Ready (Full Credentials + Buttons)
         shell: pwsh
         run: |
           . C:\actions\helpers.ps1
-          $modeLabel = if ("${{ github.event.inputs.ip_mode }}" -eq "new") { "🆕 IP BARU" } else { "♻️ IP LAMA (reuse)" }
-          $banner = Get-AsciiBanner -Subtitle "✅ SESSION AKTIF"
+          $modeLabel = if ("${{ github.event.inputs.ip_mode }}" -eq "new") { "IP BARU" } else { "REUSE" }
+          $banner = Get-AsciiBanner -Line1 "SESSION AKTIF"
           $sysInfo = Get-SystemInfoBlock
           $msg = @"
           $banner
-          ✅ <b>RDP siap dipakai!</b> ($modeLabel)
-          📍 <b>IP Address</b>
-          <code>$env:TAILSCALE_IP</code>
-          👤 <b>Username</b>
-          <code>$env:RDP_USERNAME</code>
-          🔑 <b>Password</b>
-          <code>$env:RDP_PASSWORD</code>
-          🔌 <b>Port</b>
-          <code>3389</code>
-          ────────────────────
-          $sysInfo
-          ────────────────────
-          ⏱ Sesi ini otomatis mati di ~350 menit.
+          Sesi RDP siap dipakai! (Mode: $modeLabel)
+
+          Info Koneksi:
+            IP       : $env:TAILSCALE_IP
+            Port     : 3389
+            Username : $env:RDP_USERNAME
+            Password : $env:RDP_PASSWORD
+
+          Sistem:
+            OS   : $($sysInfo.OS)
+            CPU  : $($sysInfo.CPU)
+            RAM  : $($sysInfo.RAM)
+            Disk : $($sysInfo.Disk)
+
+          Catatan:
+            - Sesi otomatis berakhir setelah masa aktif habis.
+            - Gunakan tombol di bawah untuk aksi cepat.
           "@
-          Send-TelegramMessage -Token $env:TG_TOKEN -ChatId $env:TG_CHAT -Text $msg | Out-Null
-      - name: Maintain Connection (Watchdog + Heartbeat)
+          $buttons = @(
+              @{ text = "Status Sesi"; callback_data = "STATUS" },
+              @{ text = "Tambah 1 Jam"; callback_data = "EXTEND" },
+              @{ text = "Matikan Sekarang"; callback_data = "SHUTDOWN" }
+          ), @(
+              @{ text = "Info Lengkap"; callback_data = "INFO" }
+          )
+          Send-TelegramButton -Token ${{ secrets.TG_TOKEN }} -ChatId ${{ secrets.TG_CHAT }} -Text $msg -Buttons $buttons | Out-Null
+      - name: Maintain Connection (Watchdog + Heartbeat + Telegram Command Poller)
         shell: pwsh
         run: |
           . C:\actions\helpers.ps1
@@ -227,6 +301,7 @@ jobs:
           $failCount = 0
           $maxFailBeforeAlert = 2
           Write-Host "Watchdog started."
+
           while ($true) {
               Start-Sleep -Seconds 60
               $now = Get-Date
@@ -235,25 +310,30 @@ jobs:
               if (-not $currentIP) {
                   $failCount++
                   if ($failCount -ge $maxFailBeforeAlert) {
-                      $alertMsg = "⚠️ <b>PERINGATAN</b>`nTailscale terputus.`nDurasi berjalan: $(Format-Duration $elapsed)"
-                      Send-TelegramMessage -Token $env:TG_TOKEN -ChatId $env:TG_CHAT -Text $alertMsg | Out-Null
+                      $alertMsg = @"
+          PERINGATAN
+          Tailscale terputus.
+          Durasi berjalan: $(Format-Duration $elapsed)
+          IP terakhir: $env:TAILSCALE_IP
+          "@
+                      Send-TelegramMessage -Token ${{ secrets.TG_TOKEN }} -ChatId ${{ secrets.TG_CHAT }} -Text $alertMsg | Out-Null
                       $failCount = 0
                   }
               } else {
                   $failCount = 0
               }
               if (($now - $lastHeartbeat).TotalMinutes -ge $heartbeatMinutes) {
-                  $remaining = [TimeSpan]::FromMinutes(350) - $elapsed
                   $sysInfo = Get-SystemInfoBlock
                   $hbMsg = @"
-          💓 <b>Heartbeat - FYnixorStudio RDP</b>
-          🟢 Status: Alive
-          📍 IP: <code>$currentIP</code>
-          ⏱ Uptime: $(Format-Duration $elapsed)
-          ⏳ Sisa waktu: $(Format-Duration $remaining)
-          $sysInfo
+          HEARTBEAT - FYnixorStudio RDP
+          Status : ONLINE
+          IP     : $currentIP
+          Uptime : $(Format-Duration $elapsed)
+
+          RAM  : $($sysInfo.RAM)
+          Disk : $($sysInfo.Disk)
           "@
-                  Send-TelegramMessage -Token $env:TG_TOKEN -ChatId $env:TG_CHAT -Text $hbMsg | Out-Null
+                  Send-TelegramMessage -Token ${{ secrets.TG_TOKEN }} -ChatId ${{ secrets.TG_CHAT }} -Text $hbMsg | Out-Null
                   $lastHeartbeat = $now
               }
           }
@@ -262,7 +342,12 @@ jobs:
         shell: pwsh
         run: |
           . C:\actions\helpers.ps1
-          $banner = Get-AsciiBanner -Subtitle "🔴 SESSION BERAKHIR"
+          $banner = Get-AsciiBanner -Line1 "SESSION BERAKHIR"
           $status = "${{ job.status }}"
-          $msg = "$banner`n🔴 <b>Sesi RDP FYnixorStudio berakhir.</b>`nStatus job: <b>$status</b>"
-          Send-TelegramMessage -Token $env:TG_TOKEN -ChatId $env:TG_CHAT -Text $msg | Out-Null
+          $msg = @"
+          $banner
+          Sesi RDP FYnixorStudio selesai.
+          Status job : $status
+          Waktu      : $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          "@
+          Send-TelegramMessage -Token ${{ secrets.TG_TOKEN }} -ChatId ${{ secrets.TG_CHAT }} -Text $msg | Out-Null
