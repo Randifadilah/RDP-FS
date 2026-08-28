@@ -173,8 +173,8 @@ jobs:
       - name: Start Ngrok TCP Tunnel
         shell: pwsh
         run: |
-          & C:\Tools\ngrok\ngrok.exe config add-authtoken "${{ secrets.NGROK_TOKEN }}"
-          Start-Process -FilePath "C:\Tools\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
+          & C:\Tools\ngrok.exe config add-authtoken "${{ secrets.NGROK_TOKEN }}"
+          Start-Process -FilePath "C:\Tools\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
 
           $address = $null
           for ($i = 0; $i -lt 12 -and -not $address; $i++) {
